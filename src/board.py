@@ -1,62 +1,59 @@
 import random
-import struct
-import typing
+from typing import List, Tuple
+
+__all__ = ["board"]
 
 class board:
-    """
-    64-bit bitboard implementation for 2048
+    """64‑bit bit‑board implementation for the 2048 game.
 
-    index:
-     0  1  2  3
-     4  5  6  7
-     8  9 10 11
-    12 13 14 15
+    Layout (index order):
+        0  1  2  3
+        4  5  6  7
+        8  9 10 11
+       12 13 14 15
 
-    note that the 64-bit raw value is stored in little endian
-    i.e., 0x4312752186532731 is displayed as
-    +------------------------+
-    |     2     8   128     4|
-    |     8    32    64   256|
-    |     2     4    32   128|
-    |     4     2     8    16|
-    +------------------------+
+    Internally the 16 four‑bit tiles are packed into a 64‑bit integer (`raw`) in
+    little‑endian order.  The value stored in each nibble is *log₂(tileValue)*.
+    A zero nibble therefore represents an empty cell.
     """
 
-    def __init__(self, raw : int = 0):
-        self.raw = int(raw)
+    # ───────────────────────── initializer ────────────────────────────
+
+    def __init__(self, raw: int = 0):
+        self.raw: int = int(raw)
+
+    # ────────────────────────── basic utils ───────────────────────────
 
     def __int__(self) -> int:
         return self.raw
 
-    def fetch(self, i : int) -> int:
-        """
-        get a 16-bit row
-        """
-        return (self.raw >> (i << 4)) & 0xffff
+    # ----- row & tile helpers -------------------------------------------------
 
-    def place(self, i : int, r : int) -> None:
-        """
-        set a 16-bit row
-        """
-        self.raw = (self.raw & ~(0xffff << (i << 4))) | ((r & 0xffff) << (i << 4))
+    def fetch(self, i: int) -> int:
+        """Return *row i* as a 16‑bit integer (little‑endian)."""
+        return (self.raw >> (i << 4)) & 0xFFFF
 
-    def at(self, i : int) -> int:
-        """
-        get a 4-bit tile
-        """
-        return (self.raw >> (i << 2)) & 0x0f
+    def place(self, i: int, r: int) -> None:
+        """Overwrite *row i* with the 16‑bit value *r*."""
+        self.raw = (self.raw & ~(0xFFFF << (i << 4))) | ((r & 0xFFFF) << (i << 4))
 
-    def set(self, i : int, t : int) -> None:
-        """
-        set a 4-bit tile
-        """
-        self.raw = (self.raw & ~(0x0f << (i << 2))) | ((t & 0x0f) << (i << 2))
+    def at(self, i: int) -> int:
+        """Return log₂ of the tile at board index *i* (0‑15)."""
+        return (self.raw >> (i << 2)) & 0x0F
 
-    def __getitem__(self, i : int) -> int:
+    def set(self, i: int, t: int) -> None:
+        """Set board index *i* to log₂ value *t*.  (0 clears the tile)."""
+        self.raw = (self.raw & ~(0x0F << (i << 2))) | ((t & 0x0F) << (i << 2))
+
+    # ----- container dunder ---------------------------------------------------
+
+    def __getitem__(self, i: int) -> int:
         return self.at(i)
 
-    def __setitem__(self, i : int, t : int) -> None:
+    def __setitem__(self, i: int, t: int) -> None:
         self.set(i, t)
+
+    # ----- comparisons --------------------------------------------------------
 
     def __eq__(self, other) -> bool:
         return isinstance(other, board) and self.raw == other.raw
@@ -64,100 +61,101 @@ class board:
     def __lt__(self, other) -> bool:
         return isinstance(other, board) and self.raw < other.raw
 
-    def __ne__(self, other) -> bool:
-        return not self == other
+    def __hash__(self) -> int:
+        return hash(self.raw)
 
-    def __gt__(self, other) -> bool:
-        return isinstance(other, board) and other < self
-
-    def __le__(self, other) -> bool:
-        return isinstance(other, board) and not other < self
-
-    def __ge__(self, other) -> bool:
-        return isinstance(other, board) and not self < other
+    # ──────────────────────── lookup structure ─────────────────────────
 
     class lookup:
-        """
-        the lookup table for sliding board
-        """
+        """Static slide/merge lookup for each possible 16‑bit row."""
 
-        find = [None] * 65536
+        find: List["board.lookup.entry"] = [None] * 65536  # type: ignore
 
         class entry:
-            def __init__(self, row : int):
-                V = [ (row >> 0) & 0x0f, (row >> 4) & 0x0f, (row >> 8) & 0x0f, (row >> 12) & 0x0f ]
-                L, score = board.lookup.entry.mvleft(V)
-                V.reverse() # mirror
-                R, score = board.lookup.entry.mvleft(V)
+            def __init__(self, row: int):
+                V = [
+                    (row >> 0) & 0x0F,
+                    (row >> 4) & 0x0F,
+                    (row >> 8) & 0x0F,
+                    (row >> 12) & 0x0F,
+                ]
+                L, sc_l = board.lookup.entry._slide_left(V)
+                V.reverse()            # mirror for right move
+                R, sc_r = board.lookup.entry._slide_left(V)
                 R.reverse()
-                self.raw = row # base row (16-bit raw)
-                self.left = (L[0] << 0) | (L[1] << 4) | (L[2] << 8) | (L[3] << 12) # left operation
-                self.right = (R[0] << 0) | (R[1] << 4) | (R[2] << 8) | (R[3] << 12) # right operation
-                self.score = score # merge reward
+                self.raw: int = row
+                self.left: int = (L[0] << 0) | (L[1] << 4) | (L[2] << 8) | (L[3] << 12)
+                self.right: int = (R[0] << 0) | (R[1] << 4) | (R[2] << 8) | (R[3] << 12)
+                self.score: int = sc_l  # sc_l == sc_r
 
-            def move_left(self, raw : int, sc : int, i : int) -> tuple[int, int]:
+            # fast apply helpers ------------------------------------------------
+            def move_left(self, raw: int, sc: int, i: int) -> Tuple[int, int]:
                 return raw | (self.left << (i << 4)), sc + self.score
 
-            def move_right(self, raw : int, sc : int, i : int) -> tuple[int, int]:
+            def move_right(self, raw: int, sc: int, i: int) -> Tuple[int, int]:
                 return raw | (self.right << (i << 4)), sc + self.score
 
+            # internal slide algorithm -----------------------------------------
             @staticmethod
-            def mvleft(row : int) -> tuple[list[int], int]:
+            def _slide_left(row: List[int]) -> Tuple[List[int], int]:
                 buf = [t for t in row if t]
-                res, score = [], 0
+                res: List[int] = []
+                score = 0
                 while buf:
-                    if len(buf) >= 2 and buf[0] is buf[1]:
+                    if len(buf) >= 2 and buf[0] == buf[1]:
+                        buf[1] += 1  # merge
+                        score += 1 << buf[1]
                         buf = buf[1:]
-                        buf[0] += 1
-                        score += 1 << buf[0]
-                    res += [buf[0]]
+                    res.append(buf[0])
                     buf = buf[1:]
                 return res + [0] * (4 - len(res)), score
 
+        # build LUT -------------------------------------------------------------
         @classmethod
         def init(cls) -> None:
+            if cls.find[0] is not None:  # already built
+                return
             cls.find = [cls.entry(row) for row in range(65536)]
 
+    # build lookup at import‑time for plug‑and‑play -----------------------------
+
+    # ───────────────────── high‑level board ops ────────────────────────
+    # -- random helpers -------------------------------------------------
+
     def init(self) -> None:
-        """
-        reset to initial state, i.e., witn only 2 random tiles on board
-        """
+        """Reset to the game’s initial state (two random tiles)."""
         self.raw = 0
         self.popup()
         self.popup()
 
-    def popup(self) -> None:
-        """
-        add a new random tile on board, or do nothing if the board is full
-        2-tile: 90%
-        4-tile: 10%
-        """
-        space = [i for i in range(16) if self.at(i) == 0]
-        if space:
-            self.set(random.choice(space), 1 if random.random() < 0.9 else 2)
+    def reset(self):  # env convenience alias
+        self.init()
 
-    def move(self, opcode : int) -> int:
-        """
-        apply an action to the board
-        return the reward of the action, or -1 if the action is illegal
-        """
-        if opcode == 0:
-            return self.move_up()
-        elif opcode == 1:
-            return self.move_right()
-        elif opcode == 2:
-            return self.move_down()
-        elif opcode == 3:
-            return self.move_left()
-        else:
-            return -1
+    def popup(self) -> None:
+        """Spawn a 2‑tile (90 %) or 4‑tile (10 %) at a random empty cell."""
+        empty = [i for i in range(16) if self.at(i) == 0]
+        if empty:
+            self.set(random.choice(empty), 1 if random.random() < 0.9 else 2)
+
+    # -- move dispatcher ------------------------------------------------
+
+    def move(self, op: int) -> int:
+        return (
+            self.move_up()    if op == 0 else
+            self.move_right() if op == 1 else
+            self.move_down()  if op == 2 else
+            self.move_left()  if op == 3 else
+            -1
+        )
+
+    # -- primitive moves ------------------------------------------------
 
     def move_left(self) -> int:
         move = 0
         prev = self.raw
         score = 0
         for i in range(4):
-            move, score = self.lookup.find[self.fetch(i)].move_left(move, score, i)
+            move, score = self.lookup.find[self.fetch(i)].move_left(move, score, i)  # type: ignore[index]
         self.raw = move
         return score if move != prev else -1
 
@@ -166,7 +164,7 @@ class board:
         prev = self.raw
         score = 0
         for i in range(4):
-            move, score = self.lookup.find[self.fetch(i)].move_right(move, score, i)
+            move, score = self.lookup.find[self.fetch(i)].move_right(move, score, i)  # type: ignore[index]
         self.raw = move
         return score if move != prev else -1
 
@@ -182,53 +180,41 @@ class board:
         self.rotate_counterclockwise()
         return score
 
+    # ─────────────────── board transforms (bit‑twiddling) ──────────────
+
     def transpose(self) -> None:
-        """
-        swap rows and columns
-        +------------------------+       +------------------------+
-        |     2     8   128     4|       |     2     8     2     4|
-        |     8    32    64   256|       |     8    32     4     2|
-        |     2     4    32   128| ----> |   128    64    32     8|
-        |     4     2     8    16|       |     4   256   128    16|
-        +------------------------+       +------------------------+
-        """
-        self.raw = (self.raw & 0xf0f00f0ff0f00f0f) | ((self.raw & 0x0000f0f00000f0f0) << 12) | ((self.raw & 0x0f0f00000f0f0000) >> 12)
-        self.raw = (self.raw & 0xff00ff0000ff00ff) | ((self.raw & 0x00000000ff00ff00) << 24) | ((self.raw & 0x00ff00ff00000000) >> 24)
+        self.raw = (
+            (self.raw & 0xF0F00F0FF0F00F0F)
+            | ((self.raw & 0x0000F0F00000F0F0) << 12)
+            | ((self.raw & 0x0F0F00000F0F0000) >> 12)
+        )
+        self.raw = (
+            (self.raw & 0xFF00FF0000FF00FF)
+            | ((self.raw & 0x00000000FF00FF00) << 24)
+            | ((self.raw & 0x00FF00FF00000000) >> 24)
+        )
 
     def mirror(self) -> None:
-        """
-        reflect the board horizontally, i.e., exchange columns
-        +------------------------+       +------------------------+
-        |     2     8   128     4|       |     4   128     8     2|
-        |     8    32    64   256|       |   256    64    32     8|
-        |     2     4    32   128| ----> |   128    32     4     2|
-        |     4     2     8    16|       |    16     8     2     4|
-        +------------------------+       +------------------------+
-        """
-        self.raw = ((self.raw & 0x000f000f000f000f) << 12) | ((self.raw & 0x00f000f000f000f0) << 4) \
-                 | ((self.raw & 0x0f000f000f000f00) >> 4) | ((self.raw & 0xf000f000f000f000) >> 12)
+        self.raw = (
+            ((self.raw & 0x000F000F000F000F) << 12)
+            | ((self.raw & 0x00F000F000F000F0) << 4)
+            | ((self.raw & 0x0F000F000F000F00) >> 4)
+            | ((self.raw & 0xF000F000F000F000) >> 12)
+        )
 
     def flip(self) -> None:
-        """
-        reflect the board vertically, i.e., exchange rows
-        +------------------------+       +------------------------+
-        |     2     8   128     4|       |     4     2     8    16|
-        |     8    32    64   256|       |     2     4    32   128|
-        |     2     4    32   128| ----> |     8    32    64   256|
-        |     4     2     8    16|       |     2     8   128     4|
-        +------------------------+       +------------------------+
-        """
-        self.raw = ((self.raw & 0x000000000000ffff) << 48) | ((self.raw & 0x00000000ffff0000) << 16) \
-                 | ((self.raw & 0x0000ffff00000000) >> 16) | ((self.raw & 0xffff000000000000) >> 48)
+        self.raw = (
+            ((self.raw & 0x000000000000FFFF) << 48)
+            | ((self.raw & 0x00000000FFFF0000) << 16)
+            | ((self.raw & 0x0000FFFF00000000) >> 16)
+            | ((self.raw & 0xFFFF000000000000) >> 48)
+        )
 
-    def rotate(self, r : int = 1) -> None:
-        """
-        rotate the board clockwise by given times
-        """
+    # composite rotations ------------------------------------------------
+
+    def rotate(self, r: int = 1) -> None:
         r = ((r % 4) + 4) % 4
-        if r == 0:
-            pass
-        elif r == 1:
+        if r == 1:
             self.rotate_clockwise()
         elif r == 2:
             self.reverse()
@@ -236,32 +222,32 @@ class board:
             self.rotate_counterclockwise()
 
     def rotate_clockwise(self) -> None:
-        self.transpose()
-        self.mirror()
+        self.transpose(); self.mirror()
 
     def rotate_counterclockwise(self) -> None:
-        self.transpose()
-        self.flip()
+        self.transpose(); self.flip()
 
     def reverse(self) -> None:
-        self.mirror()
-        self.flip()
+        self.mirror(); self.flip()
+
+    # ─────────────────────── convenience helpers ──────────────────────
+
+    def clone(self) -> "board":
+        return board(self.raw)
+
+    def can_move(self) -> bool:
+        return any(self.clone().move(op) != -1 for op in range(4))
+
+    # ──────────────────────── pretty‑print UI ─────────────────────────
 
     def __str__(self) -> str:
-        state = '+' + '-' * 24 + '+\n'
-        for i in range(0, 16, 4):
-            state += ('|' + ''.join('{0:6d}'.format((1 << self.at(j)) & -2) for j in range(i, i + 4)) + '|\n')
-            # use -2 (0xff...fe) to remove the unnecessary 1 for (1 << 0)
-        state += '+' + '-' * 24 + '+'
-        return state
-    def reset(self):
-        self.init()
-    
-    def can_move(self) -> bool:
-        for op in range(4):
-            if self.clone().move(op) != -1:
-                return True
-        return False
-    
-    def clone(self):
-        return board(self.raw)
+        out = ["+" + "-" * 24 + "+"]
+        for r in range(4):
+            row = "|" + "".join(f"{(1 << self.at(r * 4 + c)) & -2:6d}" for c in range(4)) + "|"
+            out.append(row)
+        out.append("+" + "-" * 24 + "+")
+        return "\n".join(out)
+try:
+    board.lookup.init()  # type: ignore
+except Exception:
+    pass

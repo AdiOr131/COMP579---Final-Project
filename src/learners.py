@@ -1,32 +1,25 @@
 import abc
 import random
-import collections
 import pickle
-from typing import Any, Callable, Deque, List, Optional, Tuple
+from typing import Any, Optional, List
+
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from board import board
 from features import feature, info, error
 
-try:
-    board.lookup.init()
-except Exception:
-    pass
+
+__all__ = [
+    "Learner",
+    "FeatureTD0Learner",
+]
+
+# ───────────────────────────── base interface ──────────────────────────────
 
 class Learner(abc.ABC):
-    """
-    Abstract interface for RL learners.
-    Subclasses should implement:
-      - select_action(state, eps)
-      - update(s, a, r, s_next, a_next, done)
-      - optional store_transition/learn for experience-based
-      - save(path), load(path)
-    """
+    """Minimal RL‑learner interface so RLAgent can treat any algorithm the same."""
+
     @abc.abstractmethod
-    def select_action(self, s: Any, eps: float) -> int:
-        pass
+    def select_action(self, s: Any, eps: float) -> int: ...
 
     @abc.abstractmethod
     def update(
@@ -36,181 +29,157 @@ class Learner(abc.ABC):
         r: float,
         s_next: Any,
         a_next: Optional[int],
-        done: bool
-    ) -> None:
+        done: bool,
+    ) -> None: ...
+
+    # DQN‑style optional hooks (ignored by TD(0))
+    def store_transition(self, *_, **__):
         pass
 
-    def store_transition(
-        self, s: Any, a: int, r: float, s_next: Any, done: bool
-    ) -> None:
-        # default: no-op for tabular or on-policy learners
+    def learn(self):
         pass
 
-    def learn(self) -> None:
-        # default: no-op
-        pass
+    # checkpoint helpers -----------------------------------------------------
+    @abc.abstractmethod
+    def save(self, path: str): ...
 
     @abc.abstractmethod
-    def save(self, path: str) -> None:
-        pass
+    def load(self, path: str): ...
 
-    @abc.abstractmethod
-    def load(self, path: str) -> None:
-        pass
 
+# ─────────────────────── TD(0) after‑state learner ─────────────────────────
 
 class FeatureTD0Learner(Learner):
+    """After‑state TD(0) learner using an *additive* set of n‑tuple features.
+
+    For each legal move we evaluate Q(s,a) = r(a) + γ·V(afterstate).
+    Learning updates the *afterstate* value function V approximated by the
+    sum of all registered feature tables.
     """
-    N-tuple afterstate Q‑learning: off-policy TD(0) on afterstates (no popup) with detailed stats.
-    """
-    def __init__(self, alpha: float = 0.1, gamma: float = 0.99, sparse: bool = True):
-        self.alpha = alpha
-        self.gamma = gamma
-        self.sparse = sparse
-        self.features: list[feature] = []
-        self.scores: list[float] = []
-        self.maxtile: list[int] = []
+
+    def __init__(self, alpha: float = 0.1, gamma: float = 0.99):
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.features: List[feature] = []
+        # --- statistics (optional) ---
+        self._scores: List[float] = []
+        self._maxtile: List[int] = []
+
+    # ──────────────────────── feature management ──────────────────────────
 
     def add_feature(self, feat: feature) -> None:
-        orig_size = feat.size()
-        if self.sparse:
-            feat.weight = collections.defaultdict(float)
+        """Register a pre‑constructed feature table.
+
+        *No* sparse override here — the Pattern class indexes `weight` as a list;
+        replacing it with a dict would break indexing semantics.
+        """
         self.features.append(feat)
-        sign = f"{feat.name()}, size = {orig_size}"
-        usage = orig_size * 4
-        if   usage >= (1 << 30): size = f"{usage >> 30}GB"
-        elif usage >= (1 << 20): size = f"{usage >> 20}MB"
-        elif usage >= (1 << 10): size = f"{usage >> 10}KB"
-        else:                    size = f"{usage}B"
-        info(f"{sign} ({size})")
+        usage_bytes = feat.size() * 4  # float32
+        if   usage_bytes >= 1 << 30:
+            usage = f"{usage_bytes >> 30} GB"
+        elif usage_bytes >= 1 << 20:
+            usage = f"{usage_bytes >> 20} MB"
+        elif usage_bytes >= 1 << 10:
+            usage = f"{usage_bytes >> 10} KB"
+        else:
+            usage = f"{usage_bytes} B"
+        info(f"Registered feature: {feat.name()} (size = {feat.size()}, {usage})")
+
+    # ─────────────────────── policy (ϵ‑greedy) ────────────────────────────
 
     def select_action(self, s: int, eps: float) -> int:
-        """ε-greedy over afterstate Q-values (no popup simulation)."""
+        """Return an action ∈ {0,1,2,3} using ϵ‑greedy after‑state values."""
         if random.random() < eps:
             return random.randrange(4)
-        best_a, best_v = 0, -float('inf')
+
+        best_a, best_q = 0, -float("inf")
         for a in range(4):
-            b = board(s).clone()
-            reward = b.move(a)
-            if reward == -1:
-                continue
-            # value = estimated V(afterstate)
-            value = sum(f.estimate(b) for f in self.features)
-            q = reward + self.gamma * value
-            if q > best_v:
-                best_v, best_a = q, a
+            after = board(s)
+            r = after.move(a)
+            if r == -1:
+                continue  # illegal
+            v = sum(f.estimate(after) for f in self.features)
+            q = r + self.gamma * v
+            if q > best_q:
+                best_a, best_q = a, q
         return best_a
 
-    def update(self, s: int, a: int, r: float, s_next: int, a_next: Any, done: bool) -> None:
-        """Q-learning update on afterstates."""
-        # compute afterstate for (s,a)
-        after0 = board(s).clone()
-        reward0 = after0.move(a)
-        if reward0 == -1:
-            return
-        # current estimate
+    # ───────────────────────── TD(0) update ───────────────────────────────
+
+    def update(
+        self,
+        s: int,
+        a: Optional[int],
+        r: float,
+        s_next: int,
+        a_next: Optional[int],
+        done: bool,
+    ) -> None:
+        if a is None or a < 0 or a > 3:
+            return  # ignore invalid calls
+        if not self.features:
+            return  # nothing to train yet
+
+        # --- current afterstate value --------------------------------------
+        after0 = board(s)
+        r0 = after0.move(a)
+        if r0 == -1:
+            return  # illegal move slipped through
         v0 = sum(f.estimate(after0) for f in self.features)
-        # compute max next afterstate value from same s (off-policy):
+
+        # --- bootstrap target ---------------------------------------------
         if done:
-            v_next_max = 0.0
+            target = r0  # no future value
         else:
-            values = []
+            best_q = -float("inf")
             for a2 in range(4):
-                after1 = board(s).clone()
+                after1 = board(s_next)
                 r1 = after1.move(a2)
                 if r1 == -1:
                     continue
-                values.append(sum(f.estimate(after1) for f in self.features))
-            v_next_max = max(values) if values else 0.0
-        # Q-learning target: r + gamma * v_next_max
-        delta = r + self.gamma * v_next_max - v0
-        adjust = self.alpha * delta / len(self.features)
-        # update weights on after0
+                v1 = sum(f.estimate(after1) for f in self.features)
+                best_q = max(best_q, r1 + self.gamma * v1)
+            target = r0 + self.gamma * (0.0 if best_q == -float("inf") else best_q)
+
+        # --- weight update --------------------------------------------------
+        delta = target - v0
+        step = self.alpha * delta / len(self.features)
         for f in self.features:
-            f.update(after0, adjust)
+            f.update(after0, step)
 
-    def make_statistic(self, n: int, b: board, score: int, unit: int = 1000) -> None:
-        # (unchanged)
-        self.scores.append(score)
-        self.maxtile.append(max(b.at(i) for i in range(16)))
-        if n % unit == 0:
-            if len(self.scores) != unit or len(self.maxtile) != unit:
-                error("wrong statistic size for show statistics")
-                exit(2)
-            avg_score = sum(self.scores) / unit
-            max_score = max(self.scores)
-            info(f"{n}	avg = {avg_score:.1f}	max = {max_score}")
-            stat = [self.maxtile.count(t) for t in range(16)]
-            coef = 100.0 / unit
-            c = 0
-            t = 1
-            while c < unit and t < 16:
-                cnt = stat[t]
-                if cnt:
-                    accu = sum(stat[t:])
-                    tile = 1 << t
-                    winrate = accu * coef
-                    share = cnt * coef
-                    info(f"	{tile}	{winrate:.1f}%	({share:.1f}%)")
-                c += cnt; t += 1
-            self.scores.clear(); self.maxtile.clear()
-            
-    def save(self, path: str) -> None:
-        """Pickle the feature list."""
-        with open(path, 'wb') as f:
+    # ────────────────────────── utils / I/O ───────────────────────────────
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
             pickle.dump(self.features, f)
-        info(f"Saved features to {path}")
+        info(f"[FeatureTD0] saved feature list → {path}")
 
-    def load(self, path: str) -> None:
-        """Load feature list from pickle."""
+    def load(self, path: str):
         try:
-            with open(path, 'rb') as f:
+            with open(path, "rb") as f:
                 self.features = pickle.load(f)
-            info(f"Loaded features from {path}")
+            info(f"[FeatureTD0] loaded feature list ← {path}")
         except FileNotFoundError:
-            pass
+            error(f"Cannot load learner weights: {path} (file not found)")
 
-class FeatureTDLambdaLearner(FeatureTD0Learner):
-    """
-    N-tuple afterstate TD(λ) learner with eligibility traces.
-    """
-    def __init__(self, alpha: float = 0.1, gamma: float = 0.99, lam: float = 0.8, sparse: bool = True):
-        super().__init__(alpha, gamma, sparse)
-        self.lam = lam
-        self.traces: list[float] = []
+    # ────────────────────────── simple stats (optional) ───────────────────
 
-    def add_feature(self, feat: feature) -> None:
-        """Add a feature and initialize its eligibility trace."""
-        # capture original table size before sparse override
-        orig_size = feat.size()
-        super().add_feature(feat)
-        self.traces.append(0.0)
+    def record_episode(self, b: board, score: float):
+        self._scores.append(score)
+        self._maxtile.append(max(b.at(i) for i in range(16)))
 
-    def reset_traces(self) -> None:
-        """Reset all eligibility traces (call at episode start)."""
-        self.traces = [0.0] * len(self.features)
-
-    def select_action(self, s: int, eps: float) -> int:
-        # same as TD0
-        return super().select_action(s, eps)
-
-    def update(self, s: int, a: Any, r: float, s_next: int, a_next: Any, done: bool) -> None:
-        """TD(λ) update with accumulating eligibility traces."""
-        b0 = board(s)
-        v0 = sum(f.estimate(b0) for f in self.features)
-        b1 = board(s_next)
-        v1 = 0.0 if done else sum(f.estimate(b1) for f in self.features)
-        delta = r + self.gamma * v1 - v0
-        # accumulate traces and update weights
-        for i, f in enumerate(self.features):
-            self.traces[i] = self.gamma * self.lam * self.traces[i] + 1.0
-            f.update(b1, self.alpha * delta * self.traces[i])
-
-    def make_statistic(self, n: int, b: board, score: int, unit: int = 1000) -> None:
-        super().make_statistic(n, b, score, unit)
-
-    def save(self, path: str) -> None:
-        super().save(path)
-
-    def load(self, path: str) -> None:
-        super().load(path)
+    def flush_stats(self, n: int, unit: int = 1000):
+        if n % unit != 0 or not self._scores:
+            return
+        avg_score = sum(self._scores) / len(self._scores)
+        max_score = max(self._scores)
+        info(f"{n}\tavg = {avg_score:.1f}\tmax = {max_score}")
+        # tile distribution
+        counts = [self._maxtile.count(t) for t in range(16)]
+        coef = 100 / len(self._scores)
+        for t in range(1, 16):
+            if counts[t]:
+                win = sum(counts[t:]) * coef
+                share = counts[t] * coef
+                info(f"\t{1<<t}\t{win:.1f}%\t({share:.1f}%)")
+        self._scores.clear(); self._maxtile.clear()
